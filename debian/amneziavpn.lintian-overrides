@@ -1,0 +1,7 @@
+# The package intentionally preserves the upstream-compatible private layout.
+amneziavpn binary: dir-or-file-in-opt [opt/AmneziaVPN/]
+amneziavpn binary: dir-or-file-in-opt [opt/AmneziaVPN/*]
+# Private runtime copies are isolated from system library packages.
+amneziavpn binary: embedded-library * [opt/AmneziaVPN/*]
+# The bundled Go tunnel is intentionally self-contained.
+amneziavpn binary: statically-linked-binary [opt/AmneziaVPN/bin/tun2socks]

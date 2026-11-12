@@ -1,0 +1,23 @@
+amneziavpn (5.1.0.6+git20261112.864c1faab811-0ubuntu1~obs1) resolute; urgency=medium
+
+  * Update to upstream commit 864c1faab81166579a43a06fde9dbc9076b0be92.
+
+ -- Dmitriy Volkov <dennshield@duck.com>  Thu, 12 Nov 2026 10:30:47 +0000
+
+amneziavpn (5.1.0.6-0ubuntu1~obs3) resolute; urgency=medium
+
+  * Remove the legacy run-installer payload during migration.
+
+ -- Dmitriy Volkov <dennshield@duck.com>  Thu, 12 Nov 2026 14:45:00 +0500
+
+amneziavpn (5.1.0.6-0ubuntu1~obs2) resolute; urgency=medium
+
+  * Resolve bundled transitive dependencies at application runtime.
+
+ -- Dmitriy Volkov <dennshield@duck.com>  Thu, 12 Nov 2026 12:56:47 +0500
+
+amneziavpn (5.1.0.6-0ubuntu1~obs1) resolute; urgency=medium
+
+  * Initial native Ubuntu package from the official development branch.
+
+ -- Dmitriy Volkov <dennshield@duck.com>  Wed, 11 Nov 2026 01:00:00 +0500

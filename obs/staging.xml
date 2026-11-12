@@ -1,0 +1,15 @@
+<project name="home:dwolfF:amnezia-vpn:staging">
+  <title>AmneziaVPN Ubuntu staging</title>
+  <description>Protected AmneziaVPN sources and binaries requiring automated installation and GUI checks before release.</description>
+  <person userid="dwolfF" role="maintainer"/>
+  <publish>
+    <disable/>
+  </publish>
+  <repository name="xUbuntu_26.04">
+    <releasetarget project="home:dwolfF:amnezia-vpn" repository="xUbuntu_26.04" trigger="manual"/>
+    <path project="Ubuntu:26.04" repository="standard"/>
+    <path project="Ubuntu:26.04" repository="universe"/>
+    <path project="Ubuntu:26.04" repository="universe-update"/>
+    <arch>x86_64</arch>
+  </repository>
+</project>

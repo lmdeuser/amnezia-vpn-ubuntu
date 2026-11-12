@@ -1,0 +1,70 @@
+Source: amneziavpn
+Section: net
+Priority: optional
+Maintainer: Dmitriy Volkov <dennshield@duck.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ lintian,
+ gpg,
+ cmake (>= 3.25),
+ ninja-build,
+ patchelf,
+ git,
+ pkg-config,
+ qt6-base-dev,
+ qt6-base-private-dev,
+ qt6-declarative-dev,
+ qt6-remoteobjects-dev,
+ qt6-5compat-dev,
+ qt6-shadertools-dev,
+ qt6-httpserver-dev,
+ qt6-websockets-dev,
+ qt6-svg-dev,
+ qt6-svg-plugins,
+ qt6-tools-dev,
+ qt6-tools-dev-tools,
+ qt6-l10n-tools,
+ libssl-dev,
+ libssh-dev,
+ zlib1g-dev,
+ liblz4-dev,
+ liblzo2-dev,
+ libnl-3-dev,
+ libnl-genl-3-dev,
+ libcap-ng-dev,
+ libtool,
+ automake,
+ pkgconf,
+ libsecret-1-dev,
+ libxkbcommon-dev,
+ python3,
+ python3-pip,
+ python3-venv,
+ python3-requests,
+ python3-urllib3,
+ python3-colorama,
+ python3-yaml,
+ python3-patch-ng,
+ python3-fasteners,
+ python3-distro,
+ python3-jinja2,
+ python3-dateutil,
+ python3-setuptools,
+ python3-wheel,
+ golang-go
+Standards-Version: 4.7.2
+Homepage: https://amnezia.org/
+
+Package: amneziavpn
+Architecture: amd64
+Depends:
+ ${misc:Depends},
+ libc6,
+ iptables,
+ iproute2,
+ libxkbcommon-x11-0,
+ libsecret-1-0
+Description: Amnezia VPN client
+ AmneziaVPN is an open-source VPN client with support for self-hosted VPN
+ servers, AmneziaWG, WireGuard, OpenVPN, XRay and other protocols.
+ This package is built from the official development branch for Ubuntu 26.04.

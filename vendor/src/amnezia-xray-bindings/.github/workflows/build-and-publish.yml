@@ -1,0 +1,93 @@
+name: 'Build artifacts'
+
+on: push
+
+jobs:
+  Build-Windows:
+    strategy:
+      matrix:
+        include:
+          - { sys: mingw64, env: x86_64 }
+
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MSYS2 with dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{matrix.sys}}
+          install: >-
+            mingw-w64-${{matrix.env}}-gcc
+            mingw-w64-${{matrix.env}}-tools-git
+            mingw-w64-${{matrix.env}}-go
+            make
+
+      - name: Build
+        shell: msys2 {0}
+        run: OS=windows make
+
+      - name: Publish artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: amnezia-xray_windows-${{matrix.env}}
+          path: build/
+
+      - name: Zip folder
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: powershell
+        run: Compress-Archive -Path "build" -DestinationPath "build.zip"
+
+      - name: Upload to release
+        uses: svenstaro/upload-release-action@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          file: build.zip
+          asset_name: amnezia-xray_windows-${{matrix.env}}.zip
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref }}
+
+  Build-Unix:
+    strategy:
+      matrix:
+        include:
+          - { os: linux, arch: amd64, runs-on: ubuntu-latest }
+          - { os: macos, arch: arm64,  runs-on: macos-latest  }
+          - { os: macos, arch: amd64, runs-on: macos-latest  }
+          - { os: ios,   arch: arm64,  runs-on: macos-latest  }
+
+    runs-on: ${{matrix.runs-on}}
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install golang
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.24'
+
+      - name: Build
+        run: OS=${{matrix.os}} ARCH=${{matrix.arch}} make
+
+      - name: Publish artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: amnezia-xray_${{matrix.os}}-${{matrix.arch}}
+          path: build/
+
+      - name: Zip folder
+        if: startsWith(github.ref, 'refs/tags/')
+        run: zip -r build.zip build/
+
+      - name: Upload to release
+        uses: svenstaro/upload-release-action@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          file: build.zip
+          asset_name: amnezia-xray_${{matrix.os}}-${{matrix.arch}}.zip
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref }}

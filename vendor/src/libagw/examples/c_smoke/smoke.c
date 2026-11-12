@@ -1,0 +1,91 @@
+/* Offline smoke test for the C ABI: no network, exercises handle lifecycle,
+ * error codes, trace, state round-trip and cancellation plumbing.
+ *
+ *   go build -buildmode=c-archive -o libagw.a ./archive
+ *   cc examples/c_smoke/smoke.c libagw.a -Icabi -o smoke && ./smoke
+ *
+ * On macOS add: -framework CoreFoundation -framework Security
+ * (Go's crypto/x509 uses the platform certificate verifier there.)
+ */
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "agw.h"
+
+int main(void)
+{
+    assert(agw_abi_version() == 2);
+
+    /* Invalid configs are rejected. */
+    assert(agw_client_create(NULL, NULL) == 0);
+    assert(agw_client_create("not json", NULL) == 0);
+    assert(agw_client_create("{}", NULL) == 0);
+
+    /* A syntactically valid config with a garbage key still creates a
+     * client; the key is validated per request. */
+    agw_client_handle client = agw_client_create(
+            "{\"gateway_endpoint\":\"http://127.0.0.1:1\","
+            "\"public_key_pem\":\"garbage\","
+            "\"request_timeout_msecs\":200}",
+            NULL);
+    assert(client != 0);
+
+    /* Envelope build fails offline: the key is garbage. The trace says so. */
+    agw_result r = agw_post(client, "v1/services", "{}", NULL, 0);
+    assert(r.code == AGW_ERR_CONFIG);
+    assert(r.body == NULL && r.body_len == 0);
+    assert(r.trace != NULL && r.trace_len == strlen(r.trace));
+    assert(strstr(r.trace, "envelope:") != NULL);
+    assert(strstr(r.trace, "result: gateway public key") != NULL);
+    agw_result_free(&r);
+    assert(r.body == NULL && r.body_len == 0);
+    assert(r.trace == NULL && r.trace_len == 0);
+
+    const char *msg = agw_error_string(AGW_ERR_CONFIG);
+    assert(msg != NULL && strlen(msg) > 0);
+
+    /* State round-trip. */
+    char *state = agw_export_state(client);
+    assert(state != NULL && strstr(state, "\"version\":1") != NULL);
+    assert(agw_import_state(client, state) == AGW_OK);
+    assert(agw_import_state(client, "junk") == AGW_ERR_INVALID_ARGUMENT);
+    agw_string_free(state);
+
+    /* Cancel handle lifecycle (single-shot, idempotent cancel). */
+    agw_cancel_handle cancel = agw_cancel_create();
+    assert(cancel != 0);
+    agw_cancel_cancel(cancel);
+    agw_cancel_cancel(cancel);
+    r = agw_post(client, "v1/services", "{}", NULL, cancel);
+    assert(r.code == AGW_CANCELLED);
+    assert(r.trace != NULL);
+    agw_result_free(&r);
+    agw_cancel_destroy(cancel);
+
+    /* Misused handles never crash the process: a destroyed or garbage handle
+     * is an error result or a no-op, a mixed-up kind is ignored. */
+    agw_cancel_destroy(cancel);              /* double destroy */
+    agw_client_destroy(cancel);              /* wrong kind: must not touch the client */
+    r = agw_post(client, "v1/services", "{}", NULL, cancel); /* destroyed cancel handle is ignored */
+    assert(r.code == AGW_ERR_CONFIG);
+    agw_result_free(&r);
+    agw_client_destroy(client);
+    agw_client_destroy(client);              /* double destroy */
+    r = agw_post(client, "v1/services", "{}", NULL, 0);
+    assert(r.code == AGW_ERR_INVALID_ARGUMENT);
+    assert(r.trace == NULL);
+    agw_result_free(&r);
+    r = agw_post((agw_client_handle)0xdeadbeef, "v1/services", "{}", NULL, 0);
+    assert(r.code == AGW_ERR_INVALID_ARGUMENT);
+    agw_result_free(&r);
+    assert(agw_export_state(client) == NULL);
+    assert(agw_import_state(client, "{}") == AGW_ERR_INVALID_ARGUMENT);
+
+    /* Unknown codes share one static string; the table never grows. */
+    assert(agw_error_string(424242) == agw_error_string(-1));
+    assert(strlen(agw_error_string(424242)) > 0);
+
+    printf("smoke ok\n");
+    return 0;
+}

@@ -1,0 +1,7 @@
+<package name="amneziavpn-secure" project="home:dwolfF:amnezia-vpn">
+  <title>AmneziaVPN for Ubuntu</title>
+  <description>Native Debian package for Ubuntu 26.04 with protected sources, public binaries, and migration from the upstream run installer.</description>
+  <sourceaccess>
+    <disable/>
+  </sourceaccess>
+</package>

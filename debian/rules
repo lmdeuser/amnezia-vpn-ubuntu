@@ -1,0 +1,57 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export TMPDIR := $(shell mkdir -p $(CURDIR)/debian/build-tmp && printf '%s' $(CURDIR)/debian/build-tmp)
+export CONAN_HOME = $(CURDIR)/debian/conan-home
+
+%:
+	dh $@ --buildsystem=cmake --builddirectory=build
+
+override_dh_auto_configure:
+	mkdir -p "$(TMPDIR)" "$(CURDIR)/build/conan-python" "$(CONAN_HOME)"
+	for archive in "$(CURDIR)/../"*"orig-vendor.tar.xz"; do if [ -f "$$archive" ]; then tar -xf "$$archive" -C "$(CURDIR)" && mv "$(CURDIR)/vendor" "$(CURDIR)/deps"; fi; done
+	for archive in "$(CURDIR)/../"*"orig-conan.tar.xz"; do if [ -f "$$archive" ]; then tar -xf "$$archive" -C "$(CURDIR)"; fi; done
+	cp "$(CURDIR)/deps/conanfile.py" "$(CURDIR)/conanfile.py"
+	cp -r "$(CURDIR)/deps/recipes/"* "$(CURDIR)/recipes/"
+	cp -r "$(CURDIR)/deps/submodules/"* "$(CURDIR)/client/3rd/"
+	cp "$(CURDIR)/deps/3rdparty.cmake" "$(CURDIR)/client/cmake/3rdparty.cmake"
+	python3 -m pip install --no-index --no-deps --no-build-isolation --target "$(CURDIR)/build/conan-python" "$(CURDIR)/tools/conan"
+	PYTHONPATH="$(CURDIR)/build/conan-python" PATH="$(CURDIR)/build/conan-python/bin:$(PATH)" conan remote disable conancenter
+	PYTHONPATH="$(CURDIR)/build/conan-python" PATH="$(CURDIR)/build/conan-python/bin:$(PATH)" conan remote disable amnezia || true
+	cp "$(CURDIR)/deps/recipes_bootstrap.cmake" "$(CURDIR)/cmake/recipes_bootstrap.cmake"
+	if [ -f "$(CURDIR)/debian/client-config.env" ]; then set -a; . "$(CURDIR)/debian/client-config.env"; set +a; fi; AMNEZIA_DEPS_DIR="$(CURDIR)/deps" GOFLAGS=-mod=vendor PYTHONPATH="$(CURDIR)/build/conan-python" PATH="$(CURDIR)/build/conan-python/bin:$(PATH)" dh_auto_configure -- -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/AmneziaVPN -DQT_DEPLOY_USE_PATCHELF=ON -DQT_DEPLOY_PATCHELF_EXECUTABLE=patchelf -DAMNEZIA_BUILD_TESTS=ON "-DCONAN_INSTALL_ARGS=--build=missing;-nr"
+
+override_dh_auto_build:
+	cmake --build build --parallel
+
+override_dh_auto_install:
+	DESTDIR="$(CURDIR)/debian/amneziavpn" cmake --install build
+	install -d "$(CURDIR)/debian/amneziavpn/opt/AmneziaVPN/lib/x86_64-linux-gnu/qt6/plugins/iconengines" "$(CURDIR)/debian/amneziavpn/opt/AmneziaVPN/lib/x86_64-linux-gnu/qt6/plugins/imageformats"
+	install -m 0644 /usr/lib/x86_64-linux-gnu/qt6/plugins/iconengines/libqsvgicon.so "$(CURDIR)/debian/amneziavpn/opt/AmneziaVPN/lib/x86_64-linux-gnu/qt6/plugins/iconengines/"
+	install -m 0644 /usr/lib/x86_64-linux-gnu/qt6/plugins/imageformats/libqsvg.so "$(CURDIR)/debian/amneziavpn/opt/AmneziaVPN/lib/x86_64-linux-gnu/qt6/plugins/imageformats/"
+	patchelf --set-rpath '$$ORIGIN/../../../' "$(CURDIR)/debian/amneziavpn/opt/AmneziaVPN/lib/x86_64-linux-gnu/qt6/plugins/iconengines/libqsvgicon.so" "$(CURDIR)/debian/amneziavpn/opt/AmneziaVPN/lib/x86_64-linux-gnu/qt6/plugins/imageformats/libqsvg.so"
+	for library in "$(CURDIR)/debian/amneziavpn/opt/AmneziaVPN/lib/x86_64-linux-gnu/"*.so*; do if [ -e "$$library" ]; then patchelf --set-rpath '$$ORIGIN' "$$library"; fi; done
+
+override_dh_auto_test:
+	mkdir -p "$(CURDIR)/debian/test-home"
+	HOME="$(CURDIR)/debian/test-home" QT_QPA_PLATFORM=offscreen ctest --test-dir build/client/tests --output-on-failure
+
+override_dh_install:
+	dh_install
+	sed -i '1{/^#!/d;}' "$(CURDIR)/debian/amneziavpn/usr/share/applications/AmneziaVPN.desktop"
+	chmod 0644 "$(CURDIR)/debian/amneziavpn/usr/share/applications/AmneziaVPN.desktop"
+	if ldd "$(CURDIR)/debian/amneziavpn/opt/AmneziaVPN/bin/AmneziaVPN" "$(CURDIR)/debian/amneziavpn/opt/AmneziaVPN/bin/AmneziaVPN-service" | grep -q 'not found'; then printf '%s\n' 'Unresolved runtime dependencies in the staged package'; exit 1; fi
+	for library in "$(CURDIR)/debian/amneziavpn/opt/AmneziaVPN/lib/x86_64-linux-gnu/"*.so*; do if [ -e "$$library" ] && [ "$$(patchelf --print-rpath "$$library")" != '$$ORIGIN' ]; then printf '%s\n' "Invalid RPATH in $$library"; exit 1; fi; done
+
+override_dh_installsystemd:
+	dh_installsystemd --name=AmneziaVPN
+
+override_dh_dwz:
+	dh_dwz -X/opt/AmneziaVPN
+
+override_dh_shlibdeps:
+	dh_shlibdeps -X/opt/AmneziaVPN
+
+override_dh_builddeb:
+	dh_builddeb
+	lintian --fail-on error "$(CURDIR)/../amneziavpn_$(shell dpkg-parsechangelog -S Version)_$(shell dpkg-architecture -qDEB_HOST_ARCH).deb" "$(CURDIR)/../SOURCES/amneziavpn_$(shell dpkg-parsechangelog -S Version).dsc"

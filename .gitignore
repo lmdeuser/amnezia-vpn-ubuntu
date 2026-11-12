@@ -1,0 +1,11 @@
+.directory
+__pycache__/
+*.py[cod]
+*.deb
+*.dsc
+*.changes
+*.buildinfo
+*.tar.*
+/.launchpad-cache/
+/debian/client-config.env
+/.state/

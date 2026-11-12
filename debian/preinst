@@ -1,0 +1,60 @@
+#!/bin/sh
+set -e
+
+is_run_install() {
+    [ -d /opt/AmneziaVPN ] \
+        && [ -f /opt/AmneziaVPN/post_uninstall.sh ] \
+        && ! dpkg-query -S /opt/AmneziaVPN/bin/AmneziaVPN >/dev/null 2>&1
+}
+
+migrate_user_settings() {
+    user=$1
+    home=$2
+    organization_dir="$home/.config/AmneziaVPN.ORG"
+    [ -d "$organization_dir" ] || return 0
+
+    group=$(id -gn "$user")
+    backup_dir="$organization_dir/run-migration-backup-$(date +%Y%m%d%H%M%S)"
+    install -d -m 700 -o "$user" -g "$group" "$backup_dir"
+
+    primary_config="$organization_dir/AmneziaVPN.conf"
+    nested_config="$organization_dir/AmneziaVPN/AmneziaVPN.conf"
+
+    if [ -f "$primary_config" ]; then
+        cp -a "$primary_config" "$backup_dir/AmneziaVPN.conf"
+    fi
+    if [ -f "$nested_config" ]; then
+        cp -a "$nested_config" "$backup_dir/nested-AmneziaVPN.conf"
+        if [ ! -e "$primary_config" ]; then
+            cp -a "$nested_config" "$primary_config"
+            chown "$user:$group" "$primary_config"
+        fi
+    fi
+}
+
+if [ "$1" = install ] || [ "$1" = upgrade ]; then
+    if is_run_install; then
+        getent passwd | while IFS=: read -r user _ uid _ _ home _; do
+            if [ "$uid" -ge 1000 ] || [ "$user" = root ]; then
+                [ -d "$home" ] && migrate_user_settings "$user" "$home"
+            fi
+        done
+
+        install -d -m 700 /var/lib/amneziavpn/run-migration
+        if [ -f /etc/systemd/system/AmneziaVPN.service ]; then
+            cp -a /etc/systemd/system/AmneziaVPN.service \
+                /var/lib/amneziavpn/run-migration/AmneziaVPN.service
+        fi
+
+        if systemctl is-active --quiet AmneziaVPN.service; then
+            systemctl stop AmneziaVPN.service
+        fi
+        systemctl disable AmneziaVPN.service >/dev/null 2>&1 || true
+        pkill -TERM -x AmneziaVPN >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/AmneziaVPN.service
+        rm -rf /opt/AmneziaVPN
+        systemctl daemon-reload
+    fi
+fi
+
+#DEBHELPER#

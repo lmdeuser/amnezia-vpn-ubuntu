@@ -1,0 +1,823 @@
+package gateway
+
+import (
+	"context"
+	"crypto/rsa"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+const testEndpoint = "v1/services"
+
+func gatewayHandler(priv *rsa.PrivateKey, hits *atomic.Int32, respond func(payload []byte) []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if hits != nil {
+			hits.Add(1)
+		}
+		body := make([]byte, 0, 4096)
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Body.Read(buf)
+			body = append(body, buf[:n]...)
+			if err != nil {
+				break
+			}
+		}
+		payload, key, iv, err := openEnvelopeErr(priv, body)
+		if err != nil {
+			http.Error(w, "bad envelope: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		ct, err := aesEncryptCBC(respond(payload), key, iv)
+		if err != nil {
+			http.Error(w, "encrypt failed", http.StatusInternalServerError)
+			return
+		}
+		w.Write(ct)
+	}
+}
+
+func proxyServer(t *testing.T, priv *rsa.PrivateKey, respond func(payload []byte) []byte) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var hits atomic.Int32
+	gw := gatewayHandler(priv, &hits, respond)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, healthPath) {
+			w.Write([]byte("ok"))
+			return
+		}
+		gw(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+func newTestClient(t *testing.T, cfg Config) *Client {
+	t.Helper()
+	if cfg.RequestTimeout == 0 {
+		cfg.RequestTimeout = 5 * time.Second
+	}
+	if cfg.ProxyStorageTimeout == 0 {
+		cfg.ProxyStorageTimeout = 2 * time.Second
+	}
+	if cfg.ProxyHealthTimeout == 0 {
+		cfg.ProxyHealthTimeout = 2 * time.Second
+	}
+	return New(cfg)
+}
+
+func errCodeOf(t *testing.T, err error) ErrorCode {
+	t.Helper()
+	var gwErr *Error
+	if !errors.As(err, &gwErr) {
+		t.Fatalf("want *gateway.Error, got %v", err)
+	}
+	return gwErr.Code
+}
+
+func TestPostDirectSuccess(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	var gotPayload []byte
+	srv := httptest.NewServer(gatewayHandler(priv, nil, func(payload []byte) []byte {
+		gotPayload = payload
+		return []byte(`{"services":["ok"]}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newTestClient(t, Config{GatewayEndpoint: srv.URL, PublicKeyPEM: pubPEM})
+	resp, err := c.Post(context.Background(), testEndpoint, []byte(`{"app_version":"4.8"}`), PostOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resp.Body) != `{"services":["ok"]}` {
+		t.Fatalf("body: %s", resp.Body)
+	}
+	if string(gotPayload) != `{"app_version":"4.8"}` {
+		t.Fatalf("server saw payload: %s", gotPayload)
+	}
+}
+
+func TestPostFailoverThroughProxy(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	var directHits atomic.Int32
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		directHits.Add(1)
+		w.Write([]byte("<html>access denied</html>"))
+	}))
+	t.Cleanup(blocked.Close)
+
+	proxy, proxyHits := proxyServer(t, priv, func([]byte) []byte {
+		return []byte(`{"services":["via-proxy"]}`)
+	})
+
+	var storageHits atomic.Int32
+	storageBody := encryptStorageList(t, pubPEM, []string{proxy.URL})
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		storageHits.Add(1)
+		w.Write(storageBody)
+	}))
+	t.Cleanup(storage.Close)
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    blocked.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+
+	opts := PostOptions{ServiceType: "amnezia-free", UserCountryCode: "ru"}
+	resp, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resp.Body) != `{"services":["via-proxy"]}` {
+		t.Fatalf("body: %s", resp.Body)
+	}
+	if storageHits.Load() == 0 {
+		t.Fatal("storage was never queried")
+	}
+
+	// The working proxy must be remembered: the second call goes straight to
+	// the proxy without touching the blocked endpoint again.
+	if _, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), opts); err != nil {
+		t.Fatal(err)
+	}
+	if directHits.Load() != 1 {
+		t.Fatalf("blocked endpoint hit %d times, want 1", directHits.Load())
+	}
+	if proxyHits.Load() < 2 {
+		t.Fatalf("proxy hit %d times, want >= 2", proxyHits.Load())
+	}
+}
+
+func TestPostKeepsRequestIDAcrossFailover(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	var mu sync.Mutex
+	var seen []string
+	record := func(r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Header.Get("X-Client-Request-ID"))
+		mu.Unlock()
+	}
+
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		w.Write([]byte("<html>access denied</html>"))
+	}))
+	t.Cleanup(blocked.Close)
+
+	brokenProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, healthPath) {
+			w.Write([]byte("ok"))
+			return
+		}
+		record(r)
+		w.Write([]byte("<html>blocked</html>"))
+	}))
+	t.Cleanup(brokenProxy.Close)
+
+	gw := gatewayHandler(priv, nil, func([]byte) []byte { return []byte(`{"ok":true}`) })
+	workingProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, healthPath) {
+			w.Write([]byte("ok"))
+			return
+		}
+		record(r)
+		gw(w, r)
+	}))
+	t.Cleanup(workingProxy.Close)
+
+	storageBody := encryptStorageList(t, pubPEM, []string{brokenProxy.URL, workingProxy.URL})
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(storageBody)
+	}))
+	t.Cleanup(storage.Close)
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    blocked.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+	opts := PostOptions{ServiceType: "amnezia-free", UserCountryCode: "ru"}
+
+	for i := 0; i < 5; i++ {
+		c.setWorkingProxy("")
+		mu.Lock()
+		seen = nil
+		mu.Unlock()
+
+		if _, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), opts); err != nil {
+			t.Fatal(err)
+		}
+
+		mu.Lock()
+		ids := append([]string(nil), seen...)
+		mu.Unlock()
+		if len(ids) < 2 {
+			t.Fatalf("want the direct attempt and at least one proxy attempt, got %d", len(ids))
+		}
+		for _, id := range ids {
+			if id == "" || id != ids[0] {
+				t.Fatalf("request ids differ within one Post: %q", ids)
+			}
+		}
+	}
+
+	mu.Lock()
+	seen = nil
+	mu.Unlock()
+	if _, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), opts); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	first := seen
+	seen = nil
+	mu.Unlock()
+	if _, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), opts); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	second := seen
+	mu.Unlock()
+	if len(first) == 0 || len(second) == 0 || first[0] == second[0] {
+		t.Fatalf("separate Posts must get separate request ids: %q vs %q", first, second)
+	}
+}
+
+func TestPostCaptchaNoFailover(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	srv := httptest.NewServer(gatewayHandler(priv, nil, func([]byte) []byte {
+		return []byte(`{"http_status":402,"captcha_id":"abc","captcha_image":"xyz"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	var storageHits atomic.Int32
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		storageHits.Add(1)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(storage.Close)
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    srv.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+	resp, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), PostOptions{})
+	// API-level errors are the caller's to interpret: the gateway answered.
+	if err != nil {
+		t.Fatalf("api error body must not become a transport error: %v", err)
+	}
+	var doc map[string]any
+	if json.Unmarshal(resp.Body, &doc) != nil || doc["http_status"] != float64(402) || doc["captcha_id"] != "abc" {
+		t.Fatalf("captcha body must be passed through, got: %s", resp.Body)
+	}
+	if storageHits.Load() != 0 {
+		t.Fatal("business errors must not trigger proxy failover")
+	}
+}
+
+func TestPostAllPathsBlocked(t *testing.T) {
+	_, pubPEM := newTestKeyPair(t)
+
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html>denied</html>"))
+	}))
+	t.Cleanup(blocked.Close)
+	storage := httptest.NewServer(http.HandlerFunc(http.NotFound))
+	t.Cleanup(storage.Close)
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    blocked.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+	_, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), PostOptions{})
+	// Parity with the Qt client: an undecryptable 200 response maps to a
+	// decryption error, not a download error.
+	if code := errCodeOf(t, err); code != DecryptError {
+		t.Fatalf("code %d, want %d", code, DecryptError)
+	}
+}
+
+func TestPostSSLErrorTriggersFailover(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	untrusted := httptest.NewTLSServer(gatewayHandler(priv, nil, func([]byte) []byte { return []byte(`{"ok":true}`) }))
+	t.Cleanup(untrusted.Close)
+	proxy, _ := proxyServer(t, priv, func([]byte) []byte { return []byte(`{"services":["via-proxy"]}`) })
+	storageBody := encryptStorageList(t, pubPEM, []string{proxy.URL})
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(storageBody)
+	}))
+	t.Cleanup(storage.Close)
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    untrusted.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+	resp, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), PostOptions{ServiceType: "svc", UserCountryCode: "ru"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resp.Body) != `{"services":["via-proxy"]}` {
+		t.Fatalf("body: %s", resp.Body)
+	}
+}
+
+func TestPostSSLErrorWithoutProxies(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	untrusted := httptest.NewTLSServer(gatewayHandler(priv, nil, func([]byte) []byte { return []byte(`{"ok":true}`) }))
+	t.Cleanup(untrusted.Close)
+	storage := httptest.NewServer(http.HandlerFunc(http.NotFound))
+	t.Cleanup(storage.Close)
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    untrusted.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+	_, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), PostOptions{})
+	if code := errCodeOf(t, err); code != SSLError {
+		t.Fatalf("code %d, want %d", code, SSLError)
+	}
+}
+
+func TestPostDropsWorkingProxyWithSSLError(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	broken := httptest.NewTLSServer(gatewayHandler(priv, nil, func([]byte) []byte { return []byte(`{"ok":true}`) }))
+	t.Cleanup(broken.Close)
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html>blocked</html>"))
+	}))
+	t.Cleanup(gw.Close)
+	storage := httptest.NewServer(http.HandlerFunc(http.NotFound))
+	t.Cleanup(storage.Close)
+	proxy, _ := proxyServer(t, priv, func([]byte) []byte { return []byte(`{"via":"proxy"}`) })
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    gw.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+	state, _ := json.Marshal(persistedState{
+		Version:      stateVersion,
+		WorkingProxy: broken.URL,
+		ProxyLists:   map[string][]string{proxyListKey("svc", "de"): {proxy.URL}},
+	})
+	if err := c.ImportState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), PostOptions{ServiceType: "svc", UserCountryCode: "de"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resp.Body) != `{"via":"proxy"}` {
+		t.Fatalf("body: %s", resp.Body)
+	}
+	var st persistedState
+	if err := json.Unmarshal(c.ExportState(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.WorkingProxy != proxy.URL {
+		t.Fatal("working proxy with a TLS error must be replaced")
+	}
+}
+
+func TestPostDropsWorkingProxyWithSSLErrorWithoutProxies(t *testing.T) {
+	_, pubPEM := newTestKeyPair(t)
+	broken := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(broken.Close)
+
+	c := newTestClient(t, Config{GatewayEndpoint: "http://127.0.0.1:1", PublicKeyPEM: pubPEM})
+	state, _ := json.Marshal(persistedState{Version: stateVersion, WorkingProxy: broken.URL})
+	if err := c.ImportState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), PostOptions{})
+	if code := errCodeOf(t, err); code != NetworkError {
+		t.Fatalf("code %d, want %d (the direct attempt is the last one)", code, NetworkError)
+	}
+	if c.getWorkingProxy() != "" {
+		t.Fatal("working proxy with a TLS error must be dropped")
+	}
+}
+
+func TestPostStaleSavedProxyFallsBackToDirect(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	stale := httptest.NewServer(http.HandlerFunc(http.NotFound))
+	stale.Close()
+	gw := httptest.NewServer(gatewayHandler(priv, nil, func([]byte) []byte { return []byte(`{"via":"direct"}`) }))
+	t.Cleanup(gw.Close)
+	var storageHits atomic.Int32
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		storageHits.Add(1)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(storage.Close)
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    gw.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+	state, _ := json.Marshal(persistedState{Version: stateVersion, WorkingProxy: stale.URL})
+	if err := c.ImportState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), PostOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resp.Body) != `{"via":"direct"}` {
+		t.Fatalf("body: %s", resp.Body)
+	}
+	if storageHits.Load() != 0 {
+		t.Fatal("a working direct path must not start a failover")
+	}
+	if c.getWorkingProxy() != "" {
+		t.Fatal("the stale proxy must be forgotten")
+	}
+	want := []string{"request ", "saved proxy: connect failed: connection refused, in tcp connect, suspicious", "saved proxy dropped", "direct: http 200, "}
+	for i, prefix := range want {
+		if i >= len(resp.Trace) || !strings.HasPrefix(resp.Trace[i], prefix) {
+			t.Fatalf("trace:\n%s", resp.Trace)
+		}
+	}
+}
+
+func TestPostPickedProxyNotRetriedInSweep(t *testing.T) {
+	_, pubPEM := newTestKeyPair(t)
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html>denied</html>"))
+	}))
+	t.Cleanup(blocked.Close)
+
+	var posts atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, healthPath) {
+			w.Write([]byte("ok"))
+			return
+		}
+		posts.Add(1)
+		w.Write([]byte("<html>denied</html>"))
+	}))
+	t.Cleanup(proxy.Close)
+	storageBody := encryptStorageList(t, pubPEM, []string{proxy.URL})
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(storageBody)
+	}))
+	t.Cleanup(storage.Close)
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    blocked.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+	if _, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), PostOptions{}); err == nil {
+		t.Fatal("want an error when every path is blocked")
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("picked proxy got %d POSTs, want 1", posts.Load())
+	}
+}
+
+func TestPostUsesCachedProxyListWhenStoragesDown(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html>denied</html>"))
+	}))
+	t.Cleanup(blocked.Close)
+	storage := httptest.NewServer(http.HandlerFunc(http.NotFound))
+	t.Cleanup(storage.Close)
+	proxy, _ := proxyServer(t, priv, func([]byte) []byte { return []byte(`{"ok":true}`) })
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    blocked.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+
+	opts := PostOptions{ServiceType: "svc", UserCountryCode: "de"}
+	state, _ := json.Marshal(persistedState{
+		Version:    stateVersion,
+		ProxyLists: map[string][]string{proxyListKey("svc", "de"): {proxy.URL}},
+	})
+	if err := c.ImportState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resp.Body) != `{"ok":true}` {
+		t.Fatalf("body: %s", resp.Body)
+	}
+}
+
+func TestPostSkipsFailedSavedProxyInFailover(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	var failedPosts atomic.Int32
+	failed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, healthPath) {
+			w.Write([]byte("ok"))
+			return
+		}
+		failedPosts.Add(1)
+		w.Write([]byte("<html>blocked</html>"))
+	}))
+	t.Cleanup(failed.Close)
+	proxy, _ := proxyServer(t, priv, func([]byte) []byte { return []byte(`{"via":"proxy"}`) })
+
+	c := newTestClient(t, Config{GatewayEndpoint: "http://127.0.0.1:1", PublicKeyPEM: pubPEM})
+	state, _ := json.Marshal(persistedState{
+		Version:      stateVersion,
+		WorkingProxy: failed.URL,
+		ProxyLists:   map[string][]string{proxyListKey("svc", "de"): {failed.URL, proxy.URL}},
+	})
+	opts := PostOptions{ServiceType: "svc", UserCountryCode: "de"}
+
+	for i := 0; i < 30; i++ {
+		failedPosts.Store(0)
+		if err := c.ImportState(state); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(resp.Body) != `{"via":"proxy"}` {
+			t.Fatalf("body: %s", resp.Body)
+		}
+		if n := failedPosts.Load(); n != 1 {
+			t.Fatalf("run %d: failed saved proxy got %d POSTs, want 1", i, n)
+		}
+	}
+}
+
+func TestPostFailoverKeepsProxySavedByConcurrentPost(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	slowArrived := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSlow) }) }
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "v1/slow") {
+			close(slowArrived)
+			<-releaseSlow
+		}
+		w.Write([]byte("<html>denied</html>"))
+	}))
+	t.Cleanup(blocked.Close)
+	t.Cleanup(release)
+	proxy, _ := proxyServer(t, priv, func([]byte) []byte { return []byte(`{"via":"proxy"}`) })
+
+	c := newTestClient(t, Config{GatewayEndpoint: blocked.URL, PublicKeyPEM: pubPEM})
+	state, _ := json.Marshal(persistedState{
+		Version:    stateVersion,
+		ProxyLists: map[string][]string{proxyListKey("svc", "de"): {proxy.URL}},
+	})
+	if err := c.ImportState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	slowErr := make(chan error, 1)
+	go func() {
+		_, err := c.Post(context.Background(), "v1/slow", []byte(`{}`), PostOptions{ServiceType: "other", UserCountryCode: "ru"})
+		slowErr <- err
+	}()
+	<-slowArrived
+
+	if _, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), PostOptions{ServiceType: "svc", UserCountryCode: "de"}); err != nil {
+		t.Fatal(err)
+	}
+	if c.getWorkingProxy() != proxy.URL {
+		t.Fatal("failover must save the proxy that answered")
+	}
+
+	release()
+	if err := <-slowErr; err == nil {
+		t.Fatal("slow Post has no proxies for its options and must fail")
+	}
+	if c.getWorkingProxy() != proxy.URL {
+		t.Fatal("failover of a direct Post erased the proxy a concurrent Post saved")
+	}
+}
+
+func TestPostContextCancel(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		gatewayHandler(priv, nil, func([]byte) []byte { return []byte(`{}`) })(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newTestClient(t, Config{GatewayEndpoint: srv.URL, PublicKeyPEM: pubPEM})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := c.Post(ctx, testEndpoint, []byte(`{}`), PostOptions{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want context error, got %v", err)
+	}
+}
+
+func TestCancelledPostKeepsTheAttemptsMadeSoFar(t *testing.T) {
+	_, pubPEM := newTestKeyPair(t)
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+	}))
+	t.Cleanup(gateway.Close)
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(storage.Close)
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:     gateway.URL,
+		PublicKeyPEM:        pubPEM,
+		S3PrimaryEndpoints:  []string{storage.URL},
+		RequestTimeout:      100 * time.Millisecond,
+		ProxyStorageTimeout: 5 * time.Second,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_, err := c.Post(ctx, testEndpoint, []byte(`{}`), PostOptions{})
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want a context error, got %v", err)
+	}
+	var cancelled *CancelledError
+	if !errors.As(err, &cancelled) {
+		t.Fatalf("want a *CancelledError, got %T", err)
+	}
+	trace := cancelled.Trace.String()
+	for _, want := range []string{"request ", "direct: timeout after", "storage 1/1: cancelled", "cancelled after"} {
+		if !strings.Contains(trace, want) {
+			t.Errorf("trace lacks %q:\n%s", want, trace)
+		}
+	}
+}
+
+func TestStateRoundTrip(t *testing.T) {
+	_, pubPEM := newTestKeyPair(t)
+	c := newTestClient(t, Config{GatewayEndpoint: "https://gw", PublicKeyPEM: pubPEM})
+	c.setWorkingProxy("https://proxy.example.com/")
+	c.mu.Lock()
+	c.proxyLists["service_a_country_b"] = []string{"https://p1/", "https://p2/"}
+	c.mu.Unlock()
+
+	blob := c.ExportState()
+
+	c2 := newTestClient(t, Config{GatewayEndpoint: "https://gw", PublicKeyPEM: pubPEM})
+	if err := c2.ImportState(blob); err != nil {
+		t.Fatal(err)
+	}
+	if c2.getWorkingProxy() != "https://proxy.example.com/" {
+		t.Fatal("working proxy lost")
+	}
+	c2.mu.Lock()
+	defer c2.mu.Unlock()
+	if len(c2.proxyLists["service_a_country_b"]) != 2 {
+		t.Fatal("proxy lists lost")
+	}
+}
+
+func TestImportStateRejectsGarbage(t *testing.T) {
+	_, pubPEM := newTestKeyPair(t)
+	c := newTestClient(t, Config{GatewayEndpoint: "https://gw", PublicKeyPEM: pubPEM})
+	if err := c.ImportState([]byte("not json")); err == nil {
+		t.Fatal("garbage state must be rejected")
+	}
+	if err := c.ImportState([]byte(`{"version":99}`)); err == nil {
+		t.Fatal("unknown version must be rejected")
+	}
+}
+
+func TestPostMissingPublicKey(t *testing.T) {
+	c := newTestClient(t, Config{GatewayEndpoint: "https://gw"})
+	_, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), PostOptions{})
+	if code := errCodeOf(t, err); code != ConfigError {
+		t.Fatalf("code %d, want %d", code, ConfigError)
+	}
+}
+
+// Log messages must not carry endpoint addresses: hosts route them into
+// application logs that users export and share.
+func TestTraceTellsTheStory(t *testing.T) {
+	priv, pubPEM := newTestKeyPair(t)
+
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html>access denied</html>"))
+	}))
+	t.Cleanup(blocked.Close)
+	proxy, _ := proxyServer(t, priv, func([]byte) []byte { return []byte(`{"ok":true}`) })
+	storageBody := encryptStorageList(t, pubPEM, []string{proxy.URL})
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(storageBody)
+	}))
+	t.Cleanup(storage.Close)
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    blocked.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+	resp, err := c.Post(context.Background(), testEndpoint, []byte(`{}`), PostOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"request ",
+		"direct: http 200, 26 bytes, ",
+		"storage 1/1: http 200, ",
+		"health 1/1: ok",
+		"proxy 1/1: http 200, 16 bytes, ",
+	}
+	if len(resp.Trace) != len(want) {
+		t.Fatalf("trace:\n%s", resp.Trace)
+	}
+	for i, prefix := range want {
+		if !strings.HasPrefix(resp.Trace[i], prefix) {
+			t.Fatalf("line %d: %q, want prefix %q\nfull trace:\n%s", i, resp.Trace[i], prefix, resp.Trace)
+		}
+	}
+}
+
+func TestTraceCarriesNoEndpointAddresses(t *testing.T) {
+	_, pubPEM := newTestKeyPair(t)
+
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html>denied</html>"))
+	}))
+	t.Cleanup(blocked.Close)
+	storage := httptest.NewServer(http.HandlerFunc(http.NotFound))
+	t.Cleanup(storage.Close)
+	proxy := httptest.NewServer(http.HandlerFunc(http.NotFound))
+	t.Cleanup(proxy.Close)
+	untrusted := httptest.NewTLSServer(http.HandlerFunc(http.NotFound))
+	t.Cleanup(untrusted.Close)
+	refused := httptest.NewServer(http.HandlerFunc(http.NotFound))
+	refused.Close()
+
+	c := newTestClient(t, Config{
+		GatewayEndpoint:    blocked.URL,
+		PublicKeyPEM:       pubPEM,
+		S3PrimaryEndpoints: []string{storage.URL},
+	})
+	state, _ := json.Marshal(persistedState{
+		Version:    stateVersion,
+		ProxyLists: map[string][]string{proxyListKey("svc", "de"): {proxy.URL, untrusted.URL, refused.URL}},
+	})
+	if err := c.ImportState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := c.Post(context.Background(), testEndpoint, []byte(`{}`),
+		PostOptions{ServiceType: "svc", UserCountryCode: "de"})
+	var gwErr *Error
+	if !errors.As(err, &gwErr) {
+		t.Fatalf("want *Error, got %v", err)
+	}
+	if len(gwErr.Trace) < 6 {
+		t.Fatalf("expected a full account of the failover, got:\n%s", gwErr.Trace)
+	}
+	if gwErr.Trace[len(gwErr.Trace)-1] != "result: "+ErrorText(gwErr.Code) {
+		t.Fatalf("last line: %q", gwErr.Trace[len(gwErr.Trace)-1])
+	}
+	for _, host := range []string{blocked.URL, storage.URL, proxy.URL, untrusted.URL, refused.URL} {
+		bare := strings.TrimPrefix(strings.TrimPrefix(host, "http://"), "https://")
+		port := bare[strings.LastIndex(bare, ":"):]
+		for _, line := range gwErr.Trace {
+			if strings.Contains(line, bare) || strings.Contains(line, port) {
+				t.Errorf("trace line leaks an endpoint address: %q", line)
+			}
+		}
+	}
+	joined := gwErr.Trace.String()
+	for _, reason := range []string{"tls: ", "connect failed: connection refused, in tcp connect", "http 404"} {
+		if !strings.Contains(joined, reason) {
+			t.Errorf("trace lacks %q:\n%s", reason, joined)
+		}
+	}
+}

@@ -1,0 +1,6 @@
+deploy/data/linux/AmneziaVPN.desktop usr/share/applications
+deploy/data/linux/AmneziaVPN.png usr/share/pixmaps
+THIRD_PARTY_LICENSES.md usr/share/doc/amneziavpn
+deps/src/amnezia-xray-bindings/vendor/google.golang.org/grpc/NOTICE.txt usr/share/doc/amneziavpn/notices/grpc
+deps/src/amnezia-xray-bindings/vendor/gopkg.in/yaml.v2/NOTICE usr/share/doc/amneziavpn/notices/yaml-v2
+deps/src/tun2socks/vendor/gopkg.in/yaml.v3/NOTICE usr/share/doc/amneziavpn/notices/yaml-v3
