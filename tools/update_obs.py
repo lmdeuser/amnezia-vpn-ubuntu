@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import argparse
+import email.parser
 import hashlib
 import json
 import os
@@ -58,8 +60,65 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def write_text_atomic(path, content, mode=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".new")
+    if mode is not None:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+    else:
+        handle = temporary.open("w", encoding="utf-8")
+    try:
+        with handle as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    os.replace(temporary, path)
+
+
 def normalized_text(path):
     return "\n".join(line.rstrip() for line in path.read_text().splitlines()).strip()
+
+
+def packaging_digest(repository):
+    paths = []
+    debian_dir = repository / "debian"
+    if debian_dir.is_dir():
+        for path in debian_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(repository).as_posix()
+            if rel in {"debian/changelog", "debian/client-config.env"}:
+                continue
+            paths.append(path)
+
+    for rel in (
+        "obs/build.script",
+        "vendor/conanfile.py",
+        "vendor/3rdparty.cmake",
+        "vendor/recipes_bootstrap.cmake",
+    ):
+        candidate = repository / rel
+        if candidate.is_file():
+            paths.append(candidate)
+
+    recipes_dir = repository / "vendor/recipes"
+    if recipes_dir.is_dir():
+        for path in recipes_dir.rglob("*"):
+            if path.is_file():
+                paths.append(path)
+
+    digest = hashlib.sha256()
+    for path in sorted(set(paths), key=lambda item: item.relative_to(repository).as_posix()):
+        rel = path.relative_to(repository).as_posix()
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def remove_git_metadata(path):
@@ -143,6 +202,45 @@ def validate_dependency_versions(upstream, repository):
             raise RuntimeError(f"Upstream requires a new dependency without an offline recipe: {name}")
 
 
+def validate_debian_patches(upstream, repository):
+    patches_dir = repository / "debian/patches"
+    series = patches_dir / "series"
+    if not series.is_file():
+        return
+
+    patch_names = []
+    for raw_line in series.read_text().splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        patch_name = stripped.split("#", 1)[0].strip().split()[0]
+        patch_names.append(patch_name)
+
+    if not patch_names:
+        return
+
+    patches_root = patches_dir.resolve()
+    with tempfile.TemporaryDirectory(prefix="amnezia-patch-check-") as temporary:
+        scratch_copy = Path(temporary) / "upstream"
+        shutil.copytree(upstream, scratch_copy, ignore=shutil.ignore_patterns(".git"))
+        for patch_name in patch_names:
+            patch_path = (patches_dir / patch_name).resolve()
+            if not patch_path.is_relative_to(patches_root) or not patch_path.is_file():
+                raise RuntimeError(f"Missing or invalid Debian patch in series: {patch_name}")
+            try:
+                subprocess.run(
+                    ("patch", "-p1", "--batch", "--forward", "-s", "-i", str(patch_path)),
+                    cwd=scratch_copy,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except subprocess.CalledProcessError as error:
+                raise RuntimeError(
+                    f"Debian patch {patch_name} failed to apply cleanly; review debian/patches"
+                ) from error
+
+
 def recipe_hashes(upstream):
     return {
         str(path.relative_to(upstream)): sha256_file(path)
@@ -155,7 +253,7 @@ def write_client_config(packaging):
     values = {}
     config_source = os.environ.get("CLIENT_CONFIG_FILE")
     if config_source:
-        for token in shlex.split(Path(config_source).read_text()):
+        for token in shlex.split(Path(config_source).read_text(), comments=True):
             if token == "export":
                 continue
             name, separator, value = token.partition("=")
@@ -168,25 +266,59 @@ def write_client_config(packaging):
         if name.endswith("PUBLIC_KEY"):
             value = value.replace("\n", "\\n")
         values[name] = value
-    config = packaging / "client-config.env"
-    config.write_text("".join(f"export {name}={shlex.quote(value)}\n" for name, value in values.items()))
-    config.chmod(0o600)
+    content = "".join(f"export {name}={shlex.quote(value)}\n" for name, value in values.items())
+    write_text_atomic(packaging / "client-config.env", content, mode=0o600)
 
 
-def update_changelog(repository, package_version, commit):
-    changelog = repository / "debian/changelog"
+def prepend_changelog_entry(changelog_text, package_version, commit):
+    first_line = changelog_text.lstrip().splitlines()[0] if changelog_text.strip() else ""
+    if first_line.startswith(f"amneziavpn ({package_version}) "):
+        return changelog_text
     entry = (
         f"amneziavpn ({package_version}) resolute; urgency=medium\n\n"
         f"  * Update to upstream commit {commit}.\n\n"
         f" -- {MAINTAINER}  {format_datetime(datetime.now(timezone.utc))}\n\n"
     )
-    changelog.write_text(entry + changelog.read_text())
+    return entry + changelog_text
+
+
+def next_obs_revision(upstream_version, known_versions):
+    pattern = re.compile(rf"^{re.escape(upstream_version)}-0ubuntu1~obs(\d+)$")
+    revisions = []
+    for version in known_versions:
+        if not version:
+            continue
+        match = pattern.fullmatch(version)
+        if match:
+            revisions.append(int(match.group(1)))
+    return max(revisions, default=0) + 1
+
+
+def ensure_version_monotonic(package_version, baseline_version):
+    if not baseline_version or baseline_version == package_version:
+        return
+    result = subprocess.run(
+        ("dpkg", "--compare-versions", package_version, "gt", baseline_version),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Generated package version {package_version} is not greater than {baseline_version}"
+        )
+
+
+def parse_build_depends(control_path):
+    lines = [line for line in control_path.read_text().splitlines() if not line.startswith("#")]
+    source_paragraph = "\n".join(lines).split("\n\n", 1)[0]
+    parsed = email.parser.Parser().parsestr(source_paragraph)
+    raw = parsed.get("Build-Depends")
+    if not raw:
+        raise RuntimeError("debian/control is missing Build-Depends")
+    return " ".join(raw.split())
 
 
 def create_dsc(work, repository, upstream_version, package_version):
-    control = (repository / "debian/control").read_text()
-    build_depends = re.search(r"^Build-Depends:\n((?: .+\n)+)", control, re.MULTILINE).group(1)
-    build_depends = " ".join(line.strip() for line in build_depends.splitlines())
+    build_depends = parse_build_depends(repository / "debian/control")
     names = [
         f"amneziavpn_{upstream_version}.orig.tar.xz",
         f"amneziavpn_{upstream_version}.orig-vendor.tar.xz",
@@ -239,25 +371,27 @@ def upload_sources(work, files):
         user = os.environ.get("OBS_USER")
         password = os.environ.get("OBS_PASSWORD")
         if not user or not password:
-            raise RuntimeError("OBS_USER and OBS_PASSWORD must be configured as GitHub Actions secrets")
+            raise RuntimeError("OSC_CONFIG (or OBS_USER and OBS_PASSWORD) must be configured")
         config = work / "oscrc"
-        config.write_text(
+        write_text_atomic(
+            config,
             "[general]\n"
             "apiurl = https://api.opensuse.org\n"
             "[https://api.opensuse.org]\n"
             f"user = {user}\n"
-            f"pass = {password}\n"
+            f"pass = {password}\n",
+            mode=0o600,
         )
-        config.chmod(0o600)
     osc = ("osc", "--config", str(config), "--no-keyring")
     checkout = work / "checkout"
     checkout.mkdir()
     run(*osc, "checkout", OBS_PROJECT, OBS_PACKAGE, cwd=checkout)
     package = checkout / OBS_PROJECT / OBS_PACKAGE
-    for old_file in package.glob("amneziavpn_*.tar.xz"):
-        run(*osc, "rm", old_file.name, cwd=package)
-    for old_file in package.glob("amneziavpn_*.dsc"):
-        run(*osc, "rm", old_file.name, cwd=package)
+    new_names = {source.name for source in files}
+    for pattern in ("amneziavpn_*.tar.xz", "amneziavpn_*.dsc"):
+        for old_file in package.glob(pattern):
+            if old_file.name not in new_names:
+                run(*osc, "rm", old_file.name, cwd=package)
     for source in files:
         destination = package / source.name
         is_tracked = destination.exists()
@@ -267,10 +401,23 @@ def upload_sources(work, files):
     run(*osc, "commit", "-m", f"chore: update to {files[-1].stem}", cwd=package)
 
 
+def load_json_if_exists(path):
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Prepare and upload AmneziaVPN source packages to OBS staging")
+    parser.add_argument("--force", action="store_true", help="Upload a new OBS revision even if commit and packaging are unchanged")
+    args = parser.parse_args()
+
     repository = Path(__file__).resolve().parent.parent
     state_path = repository / "obs/upstream.json"
-    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    state = load_json_if_exists(state_path)
+    candidate = load_json_if_exists(repository / ".state/candidate.json")
+    stable = load_json_if_exists(repository / ".state/stable.json")
+    latest = candidate or stable or state
+    current_packaging = packaging_digest(repository)
+
     with tempfile.TemporaryDirectory(prefix="amneziavpn-update-") as temporary:
         work = Path(temporary)
         upstream = work / "upstream"
@@ -286,22 +433,39 @@ def main():
             str(upstream),
         )
         commit = subprocess.check_output(("git", "rev-parse", "HEAD"), cwd=upstream, text=True).strip()
-        if state.get("commit") == commit:
-            print(f"Upstream is unchanged at {commit}")
+        if not args.force and latest.get("commit") == commit and latest.get("packaging_sha256") == current_packaging:
+            print(f"Upstream and packaging are unchanged at {commit}")
             return
 
         timestamp = int(subprocess.check_output(("git", "show", "-s", "--format=%ct", "HEAD"), cwd=upstream, text=True))
         validate_packaging_overrides(upstream, repository)
         validate_dependency_versions(upstream, repository)
         current_recipe_hashes = recipe_hashes(upstream)
-        if state.get("upstream_recipes", current_recipe_hashes) != current_recipe_hashes:
+        baseline_recipes = (
+            state.get("upstream_recipes")
+            or candidate.get("upstream_recipes")
+            or stable.get("upstream_recipes")
+            or current_recipe_hashes
+        )
+        if baseline_recipes != current_recipe_hashes:
             raise RuntimeError("Upstream Conan recipes changed; review and refresh the offline recipes")
+        validate_debian_patches(upstream, repository)
 
         cmake = (upstream / "CMakeLists.txt").read_text()
         upstream_release = re.search(r"set\(AMNEZIAVPN_VERSION ([^ )]+)", cmake).group(1)
         date = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y%m%d")
         upstream_version = f"{upstream_release}+git{date}.{commit[:12]}"
-        package_version = f"{upstream_version}-0ubuntu1~obs1"
+
+        changelog_path = repository / "debian/changelog"
+        original_changelog = changelog_path.read_text()
+        known_versions = re.findall(r"^amneziavpn \(([^)]+)\)", original_changelog, re.MULTILINE)
+        for record in (state, candidate, stable):
+            if record.get("package_version"):
+                known_versions.append(record["package_version"])
+        obs_revision = next_obs_revision(upstream_version, known_versions)
+        package_version = f"{upstream_version}-0ubuntu1~obs{obs_revision}"
+        ensure_version_monotonic(package_version, stable.get("package_version"))
+
         source = work / f"amneziavpn-{upstream_version}"
         upstream.rename(source)
         orig_parent = work / "orig"
@@ -338,21 +502,24 @@ def main():
         (conan_extract / f"conan-{CONAN_VERSION}").rename(tools / "conan")
         create_archive(tools, work / f"amneziavpn_{upstream_version}.orig-conan.tar.xz", timestamp)
 
-        update_changelog(repository, package_version, commit)
+        new_changelog = prepend_changelog_entry(original_changelog, package_version, commit)
         packaging = work / "debian"
         shutil.copytree(repository / "debian", packaging)
+        (packaging / "changelog").write_text(new_changelog)
         write_client_config(packaging)
         create_archive(packaging, work / f"amneziavpn_{package_version}.debian.tar.xz", timestamp)
         files = create_dsc(work, repository, upstream_version, package_version)
         upload_sources(work, files)
 
-        state = {
+        write_text_atomic(changelog_path, new_changelog)
+        next_state = {
             "commit": commit,
             "package_version": package_version,
+            "packaging_sha256": current_packaging,
             "upstream_recipes": current_recipe_hashes,
             "upstream_version": upstream_release,
         }
-        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        write_text_atomic(state_path, json.dumps(next_state, indent=2, sort_keys=True) + "\n")
         print(f"Uploaded AmneziaVPN {package_version} from upstream commit {commit}")
 
 

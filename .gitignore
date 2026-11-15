@@ -9,3 +9,7 @@ __pycache__/
 /.launchpad-cache/
 /debian/client-config.env
 /.state/
+/.agents/
+/.pytest_cache/
+/.ruff_cache/
+/.venv/

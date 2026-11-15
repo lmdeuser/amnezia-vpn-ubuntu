@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
+import ipaddress
+import os
 import re
 import shlex
 import subprocess
@@ -39,6 +41,28 @@ def pem_at(pems, offset):
     return matches[0]
 
 
+def validate_ipv4(value, label):
+    try:
+        ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError as error:
+        raise RuntimeError(f"The {label} legacy endpoint did not match the pinned release layout") from error
+
+
+def write_secret_file(destination, content):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".new")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    os.replace(temporary, destination)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Extract the public client configuration from an official AmneziaVPN release")
     parser.add_argument("output", type=Path, help="Destination for the owner-readable shell environment file")
@@ -51,10 +75,13 @@ def main():
         with zipfile.ZipFile(apk) as archive:
             data = archive.read(NATIVE_LIBRARY)
 
-    pems = [(match.start(), match.group()) for match in re.finditer(
-        r"-----BEGIN PUBLIC KEY-----\n(?:[A-Za-z0-9+/=]+\n)+-----END PUBLIC KEY-----",
-        data.decode("latin1"),
-    )]
+    pems = [
+        (match.start(), match.group())
+        for match in re.finditer(
+            r"-----BEGIN PUBLIC KEY-----\n(?:[A-Za-z0-9+/=]+\n)+-----END PUBLIC KEY-----",
+            data.decode("latin1"),
+        )
+    ]
     if len(pems) != 2:
         raise RuntimeError(f"Expected two public client keys, found {len(pems)}")
 
@@ -70,29 +97,29 @@ def main():
         "FREE_V2_ENDPOINT": c_string(data, 0x1502FC),
         "PREM_V1_ENDPOINT": c_string(data, 0x15B005),
     }
-    if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", values["FREE_V2_ENDPOINT"]):
-        raise RuntimeError("The Free V2 legacy endpoint did not match the pinned release layout")
-    if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", values["PREM_V1_ENDPOINT"]):
-        raise RuntimeError("The Premium V1 legacy endpoint did not match the pinned release layout")
+    validate_ipv4(values["FREE_V2_ENDPOINT"], "Free V2")
+    validate_ipv4(values["PREM_V1_ENDPOINT"], "Premium V1")
     if data.index(values["DEV_AGW_ENDPOINT"].encode()) >= prod_s3_offset:
         raise RuntimeError("The development gateway is not in the expected configuration region")
-    if data.index(b"http://gw.amnezia.org:80/") < 0:
+    if b"http://gw.amnezia.org:80/" not in data:
         raise RuntimeError("The production gateway is missing")
 
+    fingerprints = {}
     for name in ("PROD_AGW_PUBLIC_KEY", "DEV_AGW_PUBLIC_KEY"):
         subprocess.run(("openssl", "pkey", "-pubin", "-noout"), input=values[name].encode(), check=True)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+        fingerprints[name] = hashlib.sha256(values[name].encode()).hexdigest()
+    if fingerprints["PROD_AGW_PUBLIC_KEY"] == fingerprints["DEV_AGW_PUBLIC_KEY"]:
+        raise RuntimeError("Production and development public keys must differ")
+
     lines = []
     for name, value in values.items():
         if name.endswith("PUBLIC_KEY"):
             value = value.replace("\n", "\\n")
         lines.append(f"export {name}={shlex.quote(value)}\n")
-    args.output.write_text("".join(lines))
-    args.output.chmod(0o600)
+    write_secret_file(args.output, "".join(lines))
     print(f"Wrote {len(values)} validated client configuration variables to {args.output}")
     for name in ("PROD_AGW_PUBLIC_KEY", "DEV_AGW_PUBLIC_KEY"):
-        fingerprint = hashlib.sha256(values[name].encode()).hexdigest()
-        print(f"{name} SHA-256: {fingerprint}")
+        print(f"{name} SHA-256: {fingerprints[name]}")
 
 
 if __name__ == "__main__":

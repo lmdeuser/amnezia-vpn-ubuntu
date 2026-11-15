@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+umask 077
 project=$(cd "$(dirname "$0")/.." && pwd -P)
 export TMPDIR="$project/.state/tmp"
 mkdir -p "$TMPDIR" "$project/.state/home"
@@ -9,23 +10,28 @@ if [[ -f $project/.state/controller.env ]]; then
     source "$project/.state/controller.env"
     set +a
 fi
-config=${OSC_CONFIG:-$HOME/.config/osc/oscrc}
+xdg_default=${XDG_CONFIG_HOME:-$HOME/.config}
+if [[ -n ${OSC_CONFIG:-} ]]; then
+    config=$OSC_CONFIG
+elif [[ -r $xdg_default/osc/oscrc ]]; then
+    config=$xdg_default/osc/oscrc
+else
+    config=$HOME/.oscrc
+fi
+config=$(realpath "$config")
 [[ -r $config ]]
-[[ -r $project/.state/client-config.env ]]
-config_dir=$(dirname "$config")
-xdg_config=${XDG_CONFIG_HOME:-$(dirname "$config_dir")}
-docker_gid=$(stat -c %g /var/run/docker.sock)
-exec docker run --rm --name amnezia-vpn-obs-controller \
-  --user "$(id -u):$(id -g)" --group-add "$docker_gid" \
-  --cpus=0.75 --memory=1g --pids-limit=256 --read-only \
-  --volume "$project:$project" --workdir "$project" \
-  --volume /var/run/docker.sock:/var/run/docker.sock \
-  --volume /usr/bin/docker:/usr/local/bin/docker:ro \
-  --volume "$config_dir:$config_dir:ro" \
-  --env "HOME=$project/.state/home" \
-  --env "XDG_CONFIG_HOME=$xdg_config" \
-  --env "OSC_CONFIG=$config" \
-  --env "CLIENT_CONFIG_FILE=$project/.state/client-config.env" \
-  --env "TMPDIR=$TMPDIR" --env AMNEZIA_CLOUD=1 \
-  --env DOCKER_BUILDKIT=0 --env PYTHONUNBUFFERED=1 \
-  amnezia-vpn-obs-controller:1
+client_config=$(realpath "${CLIENT_CONFIG_FILE:-$project/.state/client-config.env}")
+[[ -r $client_config ]]
+xdg_config=$(realpath -m "${XDG_CONFIG_HOME:-$(dirname "$(dirname "$config")")}")
+export HOME="$project/.state/home"
+export XDG_CONFIG_HOME="$xdg_config"
+export OSC_CONFIG="$config"
+export CLIENT_CONFIG_FILE="$client_config"
+export AMNEZIA_CLOUD=1
+export DOCKER_BUILDKIT=0
+export PYTHONUNBUFFERED=1
+cd "$project"
+if [[ $# -eq 0 ]]; then
+    set -- cycle
+fi
+exec python3 tools/obs_controller.py "$@"

@@ -5,11 +5,16 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
-import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+try:
+    from tools.update_obs import packaging_digest
+except ImportError:
+    from update_obs import packaging_digest
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / ".state"
@@ -19,6 +24,7 @@ PACKAGE = "amneziavpn-secure"
 BINARY_PACKAGE = "amneziavpn"
 REPOSITORY = "xUbuntu_26.04"
 ARCHITECTURE = "x86_64"
+KEEP_STABLE = 2
 UPSTREAM_URL = "https://github.com/amnezia-vpn/amnezia-client.git"
 UPSTREAM_BRANCH = "dev"
 
@@ -28,7 +34,10 @@ def run(args, **kwargs):
 
 
 def osc(*args):
-    return run(["osc", "--setopt", f"cookiejar={STATE / 'osc-cookiejar'}", *args], capture_output=True).stdout
+    return run(
+        ["osc", "--no-keyring", "--setopt", f"cookiejar={STATE / 'osc-cookiejar'}", *args],
+        capture_output=True,
+    ).stdout
 
 
 def api(path, method="GET", data=None, file=None):
@@ -62,9 +71,14 @@ def store_record(filename, record):
 
 
 def load_remote_state():
-    listing = ET.fromstring(api(f"/source/{STAGING}/pipeline-state"))
-    for entry in listing:
-        filename = entry.attrib["name"]
+    try:
+        listing = ET.fromstring(api(f"/source/{STAGING}/pipeline-state"))
+    except subprocess.CalledProcessError as error:
+        if "404" in (error.stderr or ""):
+            return
+        raise
+    for entry in listing.findall("entry"):
+        filename = entry.attrib.get("name")
         if filename in {"candidate.json", "stable.json"}:
             save_json(STATE / filename, json.loads(api(f"/source/{STAGING}/pipeline-state/{filename}")))
 
@@ -90,21 +104,37 @@ def require_same_revision(before, after):
 
 
 def build_succeeded():
-    result = ET.fromstring(api(f"/build/{STAGING}/_result?package={PACKAGE}"))
-    return any(
-        result.attrib.get("repository") == REPOSITORY
-        and result.attrib.get("arch") == ARCHITECTURE
-        and result.attrib.get("dirty") != "true"
-        and any(status.attrib.get("package") == PACKAGE and status.attrib.get("code") == "succeeded" for status in result)
-        for result in result.findall("result")
+    result_list = ET.fromstring(api(f"/build/{STAGING}/_result?package={PACKAGE}"))
+    ready = any(
+        entry.attrib.get("repository") == REPOSITORY
+        and entry.attrib.get("arch") == ARCHITECTURE
+        and entry.attrib.get("dirty") != "true"
+        and any(
+            status.attrib.get("package") == PACKAGE and status.attrib.get("code") == "succeeded"
+            for status in entry.findall("status")
+        )
+        for entry in result_list.findall("result")
     )
+    if not ready:
+        return False
+    try:
+        return build_revision() == expanded_md5()
+    except ValueError:
+        return False
 
 
 def fetch_binary(filename, destination):
     part = destination.with_suffix(destination.suffix + ".part")
     with part.open("wb") as output:
         run(
-            ["osc", "--setopt", f"cookiejar={STATE / 'osc-cookiejar'}", "api", f"/build/{STAGING}/{REPOSITORY}/{ARCHITECTURE}/{PACKAGE}/{filename}"],
+            [
+                "osc",
+                "--no-keyring",
+                "--setopt",
+                f"cookiejar={STATE / 'osc-cookiejar'}",
+                "api",
+                f"/build/{STAGING}/{REPOSITORY}/{ARCHITECTURE}/{PACKAGE}/{filename}",
+            ],
             stdout=output,
             stderr=subprocess.PIPE,
         )
@@ -159,7 +189,78 @@ def reconcile():
     )
     record.update(binary_sha256=artifact_sha, verified_at=int(time.time()))
     store_record("stable.json", record)
+    prune_state()
     print(f"Released verified {record['package_version']}", flush=True)
+
+
+def _version_key(package_version):
+    match = re.fullmatch(
+        r"(\d+(?:\.\d+)+)(?:\+git(\d+)\.[0-9a-f]+)?(?:-0ubuntu(\d+)(?:~obs(\d+))?)?",
+        package_version,
+    )
+    if not match:
+        return ((-1,), -1, -1, -1)
+    return (
+        tuple(int(part) for part in match.group(1).split(".")),
+        int(match.group(2) or 0),
+        int(match.group(3) or 0),
+        int(match.group(4) or 0),
+    )
+
+
+def prune_state(keep=KEEP_STABLE):
+    """Keep at most `keep` recent binaries in local `.state/`."""
+    records = []
+    for filename in ("stable.json", "candidate.json"):
+        rec_path = STATE / filename
+        if rec_path.exists():
+            records.append(json.loads(rec_path.read_text()))
+    pinned_md5 = {record["srcmd5"] for record in records if "srcmd5" in record}
+
+    binaries_root = STATE / "binaries"
+    if binaries_root.is_dir():
+        pattern = re.compile(rf"^{re.escape(BINARY_PACKAGE)}_(.+)_amd64\.deb$")
+        debs = []
+        for directory in binaries_root.iterdir():
+            if not directory.is_dir():
+                continue
+            for file in directory.iterdir():
+                match = pattern.fullmatch(file.name)
+                if file.is_file() and match:
+                    debs.append((file, match.group(1)))
+
+        ordered = sorted(
+            debs,
+            key=lambda item: (_version_key(item[1]), item[0].stat().st_mtime_ns),
+            reverse=True,
+        )
+        kept = [item for item in ordered if item[0].parent.name in pinned_md5]
+        for item in ordered:
+            if len(kept) >= keep:
+                break
+            if item not in kept:
+                kept.append(item)
+        kept_files = {file for file, _ in kept}
+        kept_dirs = {file.parent for file in kept_files} | {binaries_root / md5 for md5 in pinned_md5}
+        for directory in list(binaries_root.iterdir()):
+            if not directory.is_dir():
+                continue
+            if directory not in kept_dirs:
+                shutil.rmtree(directory)
+                continue
+            for file in directory.iterdir():
+                if file.is_file() and file not in kept_files:
+                    file.unlink()
+            if not any(directory.iterdir()):
+                directory.rmdir()
+
+    recheck_root = STATE / "recheck"
+    if recheck_root.is_dir():
+        for item in recheck_root.iterdir():
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
 
 
 def init_obs():
@@ -214,12 +315,20 @@ def upstream_commit():
     return commit
 
 
+def latest_submitted_record():
+    for path in (STATE / "candidate.json", STATE / "stable.json", ROOT / "obs/upstream.json"):
+        if path.exists():
+            return json.loads(path.read_text())
+    return {}
+
+
 def submit_if_needed():
     state_path = ROOT / "obs/upstream.json"
-    previous = json.loads(state_path.read_text()) if state_path.exists() else {}
+    previous = latest_submitted_record()
     commit = upstream_commit()
-    if previous.get("commit") == commit:
-        print(f"Upstream is unchanged at {commit}", flush=True)
+    current_packaging = packaging_digest(ROOT)
+    if previous.get("commit") == commit and previous.get("packaging_sha256") == current_packaging:
+        print(f"Upstream and packaging are unchanged at {commit}", flush=True)
         return False
     run(["python3", "tools/update_obs.py"], cwd=ROOT)
     record = json.loads(state_path.read_text())
@@ -239,10 +348,14 @@ def wait_for_builds():
         candidate = json.loads(candidate_path.read_text())
         if stable_path.exists() and json.loads(stable_path.read_text()).get("srcmd5") == candidate["srcmd5"]:
             return
-        result = ET.fromstring(api(f"/build/{STAGING}/_result?package={PACKAGE}"))
+        result_list = ET.fromstring(api(f"/build/{STAGING}/_result?package={PACKAGE}"))
         errors = [
             status.attrib["code"]
-            for status in result.findall(".//status")
+            for entry in result_list.findall("result")
+            if entry.attrib.get("repository") == REPOSITORY
+            and entry.attrib.get("arch") == ARCHITECTURE
+            and entry.attrib.get("dirty") != "true"
+            for status in entry.findall("status")
             if status.attrib.get("package") == PACKAGE
             and status.attrib.get("code") in {"failed", "broken", "unresolvable", "disabled", "excluded"}
         ]
@@ -264,7 +377,7 @@ def main():
     os.umask(0o077)
     STATE.mkdir(mode=0o700, exist_ok=True)
     STATE.chmod(0o700)
-    with (STATE / "pipeline.lock").open("w") as lock:
+    with (STATE / "pipeline.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -277,10 +390,13 @@ def main():
         elif args.action == "reconcile":
             reconcile()
         else:
-            load_remote_state()
-            reconcile()
-            submit_if_needed()
-            wait_for_builds()
+            try:
+                load_remote_state()
+                reconcile()
+                submit_if_needed()
+                wait_for_builds()
+            finally:
+                prune_state()
 
 
 if __name__ == "__main__":
