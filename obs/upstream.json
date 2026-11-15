@@ -1,6 +1,7 @@
 {
-  "commit": "864c1faab81166579a43a06fde9dbc9076b0be92",
-  "package_version": "5.1.0.6+git20261112.864c1faab811-0ubuntu1~obs1",
+  "commit": "5c732f6edc70fcdaf68ac4c24a713b9e8e9352b7",
+  "package_version": "5.1.1.4+git20261114.5c732f6edc70-0ubuntu1~obs2",
+  "packaging_sha256": "a1a77959aa4a023cddc582f9dcb9603c9ce8bb79d1f3befc37bf8044cb905f58",
   "upstream_recipes": {
     "recipes/amnezia-libxray/conandata.yml": "25513d3208a5d8dff73dbc75c991d6f6f5d224768f85198c0f20aae1a6e6fd6a",
     "recipes/amnezia-libxray/conanfile.py": "b8b9bc551795a074bf0ed83b4dacf48d5467f8aaa3903d010dbb953379bafafa",
@@ -32,5 +33,5 @@
     "recipes/win-split-tunnel/conanfile.py": "f28cdc04018aa4dc342134c949371f4bc672a9dad2fe0aaa824f951725864a4b",
     "recipes/wintun/conanfile.py": "1b672b935c603b36d2d09af8eee71329d1acfabc3aa2a11a4750135e7ee96fa0"
   },
-  "upstream_version": "5.1.0.6"
+  "upstream_version": "5.1.1.4"
 }

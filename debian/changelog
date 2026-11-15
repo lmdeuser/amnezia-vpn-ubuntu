@@ -1,3 +1,9 @@
+amneziavpn (5.1.1.4+git20261114.5c732f6edc70-0ubuntu1~obs2) resolute; urgency=medium
+
+  * Update to upstream commit 5c732f6edc70fcdaf68ac4c24a713b9e8e9352b7.
+
+ -- Dmitriy Volkov <dennshield@duck.com>  Sun, 15 Nov 2026 05:01:17 +0000
+
 amneziavpn (5.1.0.6+git20261112.864c1faab811-0ubuntu1~obs1) resolute; urgency=medium
 
   * Update to upstream commit 864c1faab81166579a43a06fde9dbc9076b0be92.
