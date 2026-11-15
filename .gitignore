@@ -6,7 +6,6 @@ __pycache__/
 *.changes
 *.buildinfo
 *.tar.*
-/.launchpad-cache/
 /debian/client-config.env
 /.state/
 /.agents/

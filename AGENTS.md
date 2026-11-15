@@ -1,9 +1,8 @@
 # AmneziaVPN project instructions
 
-## Public and private work
+## Repository and confidentiality
 
-- `lmdeuser/amnezia-vpn-ubuntu` is the public repository for the team and external users. Keep it free of sensitive information.
-- A separate private working repository exists for internal operations. Never make it public, publish its history, or copy its commits without a full content and metadata review.
+- `lmdeuser/amnezia-vpn-ubuntu` is the single canonical repository for this project and is public. Keep it free of sensitive information.
 - Do not publish internal IP addresses, hostnames, local usernames, checkout paths, credential locations, private maintainer identities, or other deployment details.
 - Do not commit OBS passwords, session cookies, tokens, private keys, protected client configuration, or secret-bearing logs.
 - The approved public maintainer identity is `Dmitriy Volkov <dennshield@duck.com>`. Do not substitute other personal email addresses.
