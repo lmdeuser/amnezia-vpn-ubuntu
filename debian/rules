@@ -54,4 +54,10 @@ override_dh_shlibdeps:
 
 override_dh_builddeb:
 	dh_builddeb
-	lintian --fail-on error "$(CURDIR)/../amneziavpn_$(shell dpkg-parsechangelog -S Version)_$(shell dpkg-architecture -qDEB_HOST_ARCH).deb" "$(CURDIR)/../SOURCES/amneziavpn_$(shell dpkg-parsechangelog -S Version).dsc"
+	dsc="$(CURDIR)/../SOURCES/amneziavpn_$(shell dpkg-parsechangelog -S Version).dsc"; \
+	if [ ! -f "$$dsc" ]; then dsc="$(CURDIR)/../amneziavpn_$(shell dpkg-parsechangelog -S Version).dsc"; fi; \
+	if [ -f "$$dsc" ]; then \
+		lintian --fail-on error "$(CURDIR)/../amneziavpn_$(shell dpkg-parsechangelog -S Version)_$(shell dpkg-architecture -qDEB_HOST_ARCH).deb" "$$dsc"; \
+	else \
+		lintian --fail-on error "$(CURDIR)/../amneziavpn_$(shell dpkg-parsechangelog -S Version)_$(shell dpkg-architecture -qDEB_HOST_ARCH).deb"; \
+	fi

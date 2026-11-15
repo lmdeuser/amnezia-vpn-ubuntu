@@ -1,0 +1,6 @@
+*
+!packaging/
+!packaging/verifier.Dockerfile
+!tools/
+!tools/container-check.sh
+!tools/window_check.py

@@ -1,0 +1,69 @@
+Description: Use non-default chrome fingerprint in Xray tests
+ Upstream changed protocols::xray::defaultFingerprint to firefox in 5.1.1.4,
+ making test edits to "firefox" no-ops that leave settings unchanged.
+ Use "chrome" so device-only edit tests observe an actual value change.
+Author: Dmitriy Volkov <dennshield@duck.com>
+Forwarded: not-needed
+Last-Update: 2026-11-15
+
+diff --git a/client/tests/testXrayConfigModel.cpp b/client/tests/testXrayConfigModel.cpp
+index 129bdbf..928c71b 100644
+--- a/client/tests/testXrayConfigModel.cpp
++++ b/client/tests/testXrayConfigModel.cpp
+@@ -171,7 +171,7 @@ void TestXrayConfigModel::deviceOnlyEditStaysLocal()
+                       issued(baseConfig(flowCase ? "raw" : "xhttp", "reality", flowCase ? "xtls-rprx-vision" : "")));
+ 
+     if (edit == QLatin1String("fingerprint"))
+-        model.setFingerprint("firefox");
++        model.setFingerprint("chrome");
+     else if (edit == QLatin1String("method"))
+         model.setXhttpUplinkMethod("PATCH");
+     else if (edit == QLatin1String("chunk"))
+@@ -276,14 +276,14 @@ void TestXrayConfigModel::deviceOnlyEditRebuildsClientConfig()
+ {
+     XrayConfigModel model;
+     model.updateModel(DockerContainer::Xray, issued(baseConfig("xhttp", "reality", "")));
+-    model.setFingerprint("firefox");
++    model.setFingerprint("chrome");
+     model.setXhttpUplinkMethod("PATCH");
+ 
+     const XrayProtocolConfig saved = model.getProtocolConfig();
+     QVERIFY(saved.hasClientConfig());
+     const QJsonObject native = QJsonDocument::fromJson(saved.clientConfig->nativeConfig.toUtf8()).object();
+     const QJsonObject stream = streamOf(vlessOutbound(native));
+-    QCOMPARE(stream.value("realitySettings").toObject().value("fingerprint").toString(), QStringLiteral("firefox"));
++    QCOMPARE(stream.value("realitySettings").toObject().value("fingerprint").toString(), QStringLiteral("chrome"));
+     QCOMPARE(stream.value("xhttpSettings").toObject().value("uplinkHTTPMethod").toString(), QStringLiteral("PATCH"));
+     QCOMPARE(stream.value("realitySettings").toObject().value("publicKey").toString(), key32('\x02'));
+     QCOMPARE(saved.clientConfig->id, clientId());
+@@ -294,7 +294,7 @@ void TestXrayConfigModel::deviceOnlyEditWithBrokenNativeDropsClientConfig()
+     XrayConfigModel model;
+     const QString broken = QStringLiteral(R"({"outbounds":[{"protocol":"vless","settings":{}}]})");
+     model.updateModel(DockerContainer::Xray, withNative(baseConfig("xhttp", "reality", ""), broken));
+-    model.setFingerprint("firefox");
++    model.setFingerprint("chrome");
+ 
+     QVERIFY2(!model.getProtocolConfig().hasClientConfig(),
+              "a native config that cannot be rebuilt must be dropped so the server issues a fresh one");
+@@ -307,7 +307,7 @@ void TestXrayConfigModel::unsavedChangesFollowEdits()
+     QVERIFY(!model.hasUnsavedChanges());
+ 
+     const QString original = model.fingerprint();
+-    model.setFingerprint("firefox");
++    model.setFingerprint("chrome");
+     QVERIFY(model.hasUnsavedChanges());
+     model.setFingerprint(original);
+     QVERIFY(!model.hasUnsavedChanges());
+diff --git a/client/tests/testXrayGeneratorMatrix.cpp b/client/tests/testXrayGeneratorMatrix.cpp
+index 48de0d9..14b7391 100644
+--- a/client/tests/testXrayGeneratorMatrix.cpp
++++ b/client/tests/testXrayGeneratorMatrix.cpp
+@@ -185,7 +185,7 @@ void TestXrayGeneratorMatrix::deviceOnlyChangesKeepServerView()
+                                          field == "udp443" ? "xtls-rprx-vision" : "");
+     XrayServerConfig after = before;
+     if (field == "fingerprint")
+-        after.fingerprint = QStringLiteral("firefox");
++        after.fingerprint = QStringLiteral("chrome");
+     else if (field == "uplinkMethod")
+         after.xhttp.uplinkMethod = QStringLiteral("PATCH");
+     else if (field == "uplinkChunkSize")
