@@ -4,15 +4,15 @@ This page is for the person maintaining the AmneziaVPN OBS pipeline. It does not
 
 ## Components
 
-- Controller: a self-hosted Linux machine with Docker and `osc`.
-- Checkout: `/path/to/amnezia-vpn-obs` on that machine.
+- Controller: a self-hosted Linux machine running Python and `osc` directly on the host, with Docker for isolated `.deb` verification.
+- Checkout: `~/runners/amnezia-vpn` (or `/path/to/runners/amnezia-vpn`) on that machine.
 - Staging: `home:dwolfF:amnezia-vpn:staging`.
 - Stable: `home:dwolfF:amnezia-vpn`.
 - OBS package: `amneziavpn-secure`.
 - Binary package: `amneziavpn` for Ubuntu 26.04 `amd64`.
 - Packaging source: `lmdeuser/amnezia-vpn-ubuntu`, branch `dev`.
 
-The official `amnezia-vpn/amnezia-client` repository is read-only. Nothing is pushed to it.
+Do not use GitHub Actions or GitHub runners because they are paid. The official `amnezia-vpn/amnezia-client` repository is read-only. Nothing is pushed to it.
 
 ## What a release does
 
@@ -37,7 +37,7 @@ The controller has its own cron block. The checkout path is filled in by `tools/
 
 ```text
 # BEGIN AMNEZIA OBS
-37 * * * * /usr/bin/timeout 100m /path/to/amnezia-vpn-obs/tools/cron-cycle.sh
+37 * * * * /usr/bin/timeout 100m /path/to/runners/amnezia-vpn/tools/cron-cycle.sh
 # END AMNEZIA OBS
 ```
 
@@ -47,16 +47,16 @@ Useful commands on the controller:
 
 ```bash
 crontab -l
-cat /path/to/amnezia-vpn-obs/.state/controller.log
-/path/to/amnezia-vpn-obs/tools/run-controller.sh
-python3 /path/to/amnezia-vpn-obs/tools/install_cron.py
+cat /path/to/runners/amnezia-vpn/.state/controller.log
+/path/to/runners/amnezia-vpn/tools/run-controller.sh
+python3 /path/to/runners/amnezia-vpn/tools/install_cron.py
 ```
 
 Run a manual cycle only when no other cycle is active. Do not publish `.state`, logs, credentials, session cookies, or the protected client environment.
 
 ## Credentials and client configuration
 
-`tools/run-controller.sh` reads `OSC_CONFIG` and `XDG_CONFIG_HOME` from the environment or from an ignored `.state/controller.env` file. The existing `osc` configuration is mounted read-only and is never copied into this repository.
+`tools/run-controller.sh` reads `OSC_CONFIG` and `XDG_CONFIG_HOME` from the environment or from an ignored `.state/controller.env` file. The existing `osc` configuration is referenced from those variables and is never copied into this repository.
 
 The protected client environment lives in `.state/client-config.env` with restricted permissions. It is excluded from Git and included only in protected OBS source archives. Public users can download binaries and APT metadata, but unauthenticated source requests receive HTTP `403`.
 
@@ -79,14 +79,14 @@ These changes need a manual vendor review. The controller does not fix itself or
 Automatic versions have this form:
 
 ```text
-<upstream-version>+git<UTC-YYYYMMDD>.<short-commit>-0ubuntu1~obs1
+<upstream-version>+git<UTC-YYYYMMDD>.<short-commit>-0ubuntu1~obs<N>
 ```
 
-Each upstream commit therefore has unique source archive names and a unique Debian version. Packaging-only fixes need a higher packaging revision instead. Always regenerate source archives, Debian metadata, and `.dsc` checksums together.
+Each upstream commit therefore has unique source archive names and a unique Debian version. Packaging-only fixes automatically increment the `~obs<N>` revision when packaging files change for an unchanged upstream commit. Always regenerate source archives, Debian metadata, and `.dsc` checksums together.
 
 ## Recovery
 
-Before editing the controller, disable only the AmneziaVPN cron block and wait for the active process to finish. Do not edit a running publisher or touch other projects' schedules.
+Before editing the controller, disable only the AmneziaVPN cron block (`python3 /path/to/runners/amnezia-vpn/tools/install_cron.py --remove`) and wait for the active process to finish. Do not edit a running publisher or touch other projects' schedules.
 
 Inspect staging with an authenticated `osc` client:
 

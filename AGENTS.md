@@ -13,7 +13,8 @@
 
 - The official `amnezia-vpn/amnezia-client` repository is read-only. Never push to it.
 - Compilation, upstream tests, and Debian package creation run only in OBS. Do not build the application locally.
-- The self-hosted controller only prepares sources and verifies artifacts. Do not expose its address or local configuration in public files.
+- The self-hosted controller uses the standard `~/runners/<project>/` layout (`~/runners/amnezia-vpn`) and runs Python + `osc` directly on the controller host (Docker is used only by `tools/verify-deb.sh`, without a controller Docker wrapper). Do not expose its address or local configuration in public files.
+- Never use GitHub Actions or GitHub-hosted/self-hosted runners because they are paid.
 - OBS staging sources and logs must remain protected with `sourceaccess=disable`. Direct stable builds and staging publication stay disabled.
 - Release only the exact `.deb` that passed installation, service, GUI, configuration, removal, and reinstall checks. Failed checks leave the previous stable package in place.
 - Do not run two publishers concurrently. Preserve unrelated cron jobs and OBS projects.
